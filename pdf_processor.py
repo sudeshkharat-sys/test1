@@ -1,34 +1,42 @@
 """
-Extracts tables and plain text from documents using Azure Document Intelligence.
+Extracts tables and plain text using PaddleOCR — free, runs locally, no API key needed.
 
-Supported inputs: PDF, JPG, JPEG, PNG, BMP, TIFF, HEIF
-- Pages with tables  → extracted as structured TableData (Layout model)
-- Pages with no tables → plain text extracted as a single-column TableData (Read model)
+Supported inputs: PDF, JPG, JPEG, PNG, BMP, TIFF
+- Pages with tables  → structured TableData with row/col/span info
+- Pages with no tables → plain text lines as single-column TableData
 
-All cells include per-word confidence scores. Low-confidence cells are flagged
-for manual review (common with handwritten ambiguities like O/0 and B/8).
+All cells include per-word confidence scores used for red-highlighting in Excel.
+
+First run will download PaddleOCR models (~500 MB) automatically.
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
-from azure.core.credentials import AzureKeyCredential
+import cv2
+import numpy as np
+import fitz  # PyMuPDF
+from paddleocr import PPStructure, PaddleOCR
+from bs4 import BeautifulSoup
 
 import config
 
-# Azure Document Intelligence supported MIME types
 SUPPORTED_EXTENSIONS = {
-    ".pdf": "application/pdf",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-    ".tif": "image/tiff",
-    ".heif": "image/heif",
+    ".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif",
 }
+
+# Engines are heavy — load once and reuse across calls
+_structure_engine: PPStructure | None = None
+_ocr_engine: PaddleOCR | None = None
+
+
+def _get_engines() -> tuple[PPStructure, PaddleOCR]:
+    global _structure_engine, _ocr_engine
+    if _structure_engine is None:
+        print("Loading PaddleOCR models (first run downloads ~500 MB)...")
+        _structure_engine = PPStructure(table=True, ocr=True, lang="en", show_log=False)
+        _ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+    return _structure_engine, _ocr_engine
 
 
 @dataclass
@@ -48,128 +56,178 @@ class TableData:
     row_count: int
     col_count: int
     cells: list[CellData] = field(default_factory=list)
-    # True when this "table" is actually plain OCR text (no table detected on page)
     is_plain_text: bool = False
 
 
 def analyze_document(file_path: str) -> list[TableData]:
-    """
-    Analyze any supported document (PDF or image) and return tables + plain-text pages.
-
-    For pages that contain tables, structured CellData is returned.
-    For pages with no tables (plain text / OCR), text is returned as a
-    single-column table so it still appears in the Excel output.
-    """
+    """Analyze a document or image and return tables + plain-text pages."""
     path = Path(file_path)
     ext = path.suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
         raise ValueError(
-            f"Unsupported file type '{ext}'. "
-            f"Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+            f"Unsupported file type '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
         )
 
-    client = DocumentIntelligenceClient(
-        endpoint=config.ENDPOINT,
-        credential=AzureKeyCredential(config.KEY),
-    )
+    structure_engine, ocr_engine = _get_engines()
 
-    with open(file_path, "rb") as f:
-        file_bytes = f.read()
+    if ext == ".pdf":
+        images = _pdf_to_images(file_path)
+    else:
+        img = cv2.imread(file_path)
+        if img is None:
+            raise ValueError(f"Could not read image: {file_path}")
+        images = [img]
 
-    # prebuilt-layout handles tables, handwriting, and plain text in one call
-    poller = client.begin_analyze_document(
-        model_id="prebuilt-layout",
-        body=AnalyzeDocumentRequest(bytes_source=file_bytes),
-        content_type="application/json",
-    )
-    result = poller.result()
+    all_tables: list[TableData] = []
+    for page_num, img in enumerate(images, start=1):
+        page_results = _process_image(img, page_num, structure_engine, ocr_engine)
+        all_tables.extend(page_results)
 
-    # Build a per-page word→confidence lookup
-    page_word_confidence: dict[int, dict[str, list[float]]] = {}
-    if result.pages:
-        for page in result.pages:
-            wc: dict[str, list[float]] = {}
-            if page.words:
-                for word in page.words:
-                    key = word.content.strip()
-                    wc.setdefault(key, []).append(word.confidence or 1.0)
-            page_word_confidence[page.page_number] = wc
+    return all_tables
 
-    # Track which pages already have a table so we know which are plain-text only
-    pages_with_tables: set[int] = set()
+
+def _pdf_to_images(pdf_path: str) -> list[np.ndarray]:
+    """Convert each PDF page to a BGR numpy array at 200 DPI."""
+    doc = fitz.open(pdf_path)
+    images = []
+    for page in doc:
+        pix = page.get_pixmap(dpi=200)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif pix.n == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        images.append(img)
+    doc.close()
+    return images
+
+
+def _process_image(
+    img: np.ndarray,
+    page_num: int,
+    structure_engine: PPStructure,
+    ocr_engine: PaddleOCR,
+) -> list[TableData]:
+    """Run structure + OCR analysis on one page image."""
+    structure_results = structure_engine(img.copy())
+
+    # Full-page OCR to get per-word confidence scores
+    ocr_results = ocr_engine.ocr(img.copy(), cls=True)
+    word_confidence: dict[str, list[float]] = {}
+    if ocr_results and ocr_results[0]:
+        for line in ocr_results[0]:
+            if line and len(line) == 2:
+                text, conf = line[1]
+                word_confidence.setdefault(text.strip(), []).append(float(conf))
+
     tables: list[TableData] = []
+    text_lines: list[tuple[str, float]] = []
 
-    if result.tables:
-        for table in result.tables:
-            page_num = table.bounding_regions[0].page_number if table.bounding_regions else 1
-            pages_with_tables.add(page_num)
-            wc = page_word_confidence.get(page_num, {})
+    for region in (structure_results or []):
+        rtype = region.get("type", "")
+        res = region.get("res", {})
 
-            table_data = TableData(
-                page=page_num,
-                row_count=table.row_count,
-                col_count=table.column_count,
-            )
-            for cell in table.cells:
-                cell_text = cell.content.strip() if cell.content else ""
-                min_conf = _min_confidence_for_text(cell_text, wc)
-                table_data.cells.append(
-                    CellData(
-                        row=cell.row_index,
-                        col=cell.column_index,
-                        row_span=cell.row_span or 1,
-                        col_span=cell.column_span or 1,
-                        text=cell_text,
-                        min_confidence=min_conf,
-                        is_low_confidence=min_conf < config.CONFIDENCE_THRESHOLD,
-                    )
-                )
-            tables.append(table_data)
+        if rtype == "table":
+            html = res.get("html", "") if isinstance(res, dict) else ""
+            if html:
+                table_data = _table_from_html(html, page_num, word_confidence)
+                if table_data:
+                    tables.append(table_data)
+        else:
+            # Text / title / list regions — collect lines with confidence
+            lines = res if isinstance(res, list) else []
+            for line in lines:
+                if isinstance(line, list) and len(line) == 2:
+                    text_conf = line[1]
+                    if isinstance(text_conf, (list, tuple)) and len(text_conf) == 2:
+                        text, conf = text_conf
+                        if text.strip():
+                            text_lines.append((text.strip(), float(conf)))
 
-    # For pages that had no tables, emit plain OCR text as a single-column table
-    if result.pages:
-        for page in result.pages:
-            if page.page_number in pages_with_tables:
-                continue
-            lines = page.lines or []
-            if not lines:
-                continue
+    # Emit a plain-text sheet only for pages that have no tables
+    if text_lines and not tables:
+        plain = TableData(
+            page=page_num,
+            row_count=len(text_lines),
+            col_count=1,
+            is_plain_text=True,
+        )
+        for row_idx, (text, conf) in enumerate(text_lines):
+            plain.cells.append(CellData(
+                row=row_idx, col=0, row_span=1, col_span=1,
+                text=text, min_confidence=conf,
+                is_low_confidence=conf < config.CONFIDENCE_THRESHOLD,
+            ))
+        return [plain]
 
-            wc = page_word_confidence.get(page.page_number, {})
-            plain = TableData(
-                page=page.page_number,
-                row_count=len(lines),
-                col_count=1,
-                is_plain_text=True,
-            )
-            for row_idx, line in enumerate(lines):
-                line_text = line.content.strip()
-                min_conf = _min_confidence_for_text(line_text, wc)
-                plain.cells.append(
-                    CellData(
-                        row=row_idx,
-                        col=0,
-                        row_span=1,
-                        col_span=1,
-                        text=line_text,
-                        min_confidence=min_conf,
-                        is_low_confidence=min_conf < config.CONFIDENCE_THRESHOLD,
-                    )
-                )
-            tables.append(plain)
-
-    # Return in page order
-    tables.sort(key=lambda t: t.page)
     return tables
 
 
+def _table_from_html(
+    html: str,
+    page_num: int,
+    word_confidence: dict[str, list[float]],
+) -> TableData | None:
+    """Convert a PaddleOCR HTML table string into a TableData with confidence scores."""
+    cells = _parse_html_table(html)
+    if not cells:
+        return None
+
+    max_row = max(row + rs for row, _, rs, _, _ in cells)
+    max_col = max(col + cs for _, col, _, cs, _ in cells)
+
+    table_data = TableData(page=page_num, row_count=max_row, col_count=max_col)
+    for row, col, row_span, col_span, text in cells:
+        min_conf = _min_confidence_for_text(text, word_confidence)
+        table_data.cells.append(CellData(
+            row=row, col=col,
+            row_span=row_span, col_span=col_span,
+            text=text,
+            min_confidence=min_conf,
+            is_low_confidence=min_conf < config.CONFIDENCE_THRESHOLD,
+        ))
+    return table_data
+
+
+def _parse_html_table(html: str) -> list[tuple[int, int, int, int, str]]:
+    """
+    Parse an HTML table into (row, col, rowspan, colspan, text) tuples.
+    Uses a grid-fill algorithm to correctly handle merged cells.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    rows_raw = soup.find_all("tr")
+    if not rows_raw:
+        return []
+
+    occupied: set[tuple[int, int]] = set()
+    cells: list[tuple[int, int, int, int, str]] = []
+
+    for row_idx, tr in enumerate(rows_raw):
+        col_idx = 0
+        for td in tr.find_all(["td", "th"]):
+            while (row_idx, col_idx) in occupied:
+                col_idx += 1
+
+            text = td.get_text(strip=True)
+            rowspan = max(1, int(td.get("rowspan", 1)))
+            colspan = max(1, int(td.get("colspan", 1)))
+
+            for r in range(row_idx, row_idx + rowspan):
+                for c in range(col_idx, col_idx + colspan):
+                    occupied.add((r, c))
+
+            cells.append((row_idx, col_idx, rowspan, colspan, text))
+            col_idx += colspan
+
+    return cells
+
+
 def _min_confidence_for_text(text: str, word_confidence: dict[str, list[float]]) -> float:
-    """Return the minimum confidence among all words in the given text string."""
     if not text:
         return 1.0
     confidences: list[float] = []
     for word in text.split():
         scores = word_confidence.get(word.strip(), [])
         if scores:
-            confidences.append(scores.pop(0))  # consume one entry to handle duplicate words
+            confidences.append(scores.pop(0))
     return min(confidences) if confidences else 1.0
