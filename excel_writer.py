@@ -98,8 +98,9 @@ def _write_table(ws, table: TableData) -> None:
 
     # Summary row at top
     summary = ws.cell(row=1, column=1)
+    kind = "Plain text (OCR)" if table.is_plain_text else "Table"
     summary.value = (
-        f"Table extracted from PDF  |  "
+        f"{kind}  |  Page {table.page}  |  "
         f"{table.row_count} rows × {table.col_count} cols  |  "
         f"{low_conf_count} low-confidence cell(s) highlighted in red"
     )
