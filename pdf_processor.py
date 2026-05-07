@@ -10,6 +10,11 @@ All cells include per-word confidence scores used for red-highlighting in Excel.
 First run will download PaddleOCR models (~500 MB) automatically.
 """
 
+import os
+# Disable OneDNN (MKL-DNN) — causes fused_conv2d errors on Windows CPUs
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_call_stack_level"] = "2"
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
