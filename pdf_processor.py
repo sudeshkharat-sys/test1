@@ -1,19 +1,12 @@
 """
-Extracts tables and plain text using PaddleOCR — free, runs locally, no API key needed.
+Extracts tables and plain text from PDFs and images.
 
 Supported inputs: PDF, JPG, JPEG, PNG, BMP, TIFF
-- Pages with tables  → structured TableData with row/col/span info
-- Pages with no tables → plain text lines as single-column TableData
+- Digital PDFs  → pdfplumber (fast, no OCR needed)
+- Scanned PDFs / Images → EasyOCR + img2table
 
-All cells include per-word confidence scores used for red-highlighting in Excel.
-
-First run will download PaddleOCR models (~500 MB) automatically.
+First run downloads EasyOCR models (~100 MB) automatically.
 """
-
-import os
-# Disable OneDNN (MKL-DNN) — causes fused_conv2d errors on Windows CPUs
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["FLAGS_call_stack_level"] = "2"
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,21 +14,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import fitz  # PyMuPDF
-try:
-    from paddleocr import PPStructure, PaddleOCR
-except ImportError:
-    # PaddleOCR 3.x removed PPStructure from the top-level package.
-    # Try the internal module path used by some 3.x builds.
-    try:
-        from paddleocr.ppstructure import PPStructure  # type: ignore[no-redef]
-        from paddleocr import PaddleOCR
-    except ImportError as exc:
-        raise ImportError(
-            "Cannot import PPStructure from paddleocr. "
-            "Install a compatible version with:\n"
-            "    pip install 'paddleocr>=2.8.0,<3.0.0'"
-        ) from exc
-from bs4 import BeautifulSoup
 
 import config
 
@@ -43,24 +21,16 @@ SUPPORTED_EXTENSIONS = {
     ".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif",
 }
 
-# Engines are heavy — load once and reuse across calls
-_structure_engine: PPStructure | None = None
-_ocr_engine: PaddleOCR | None = None
+_ocr_reader = None
 
 
-def _get_engines() -> tuple[PPStructure, PaddleOCR]:
-    global _structure_engine, _ocr_engine
-    if _structure_engine is None:
-        print("Loading PaddleOCR models (first run downloads ~500 MB)...")
-        _structure_engine = PPStructure(
-            table=True, ocr=True, lang="en", show_log=False,
-            enable_mkldnn=False, use_gpu=False,
-        )
-        _ocr_engine = PaddleOCR(
-            use_angle_cls=True, lang="en", show_log=False,
-            enable_mkldnn=False, use_gpu=False,
-        )
-    return _structure_engine, _ocr_engine
+def _get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+        print("Loading EasyOCR models (first run downloads ~100 MB)...")
+        _ocr_reader = easyocr.Reader(["en"], gpu=False)
+    return _ocr_reader
 
 
 @dataclass
@@ -70,7 +40,7 @@ class CellData:
     row_span: int
     col_span: int
     text: str
-    min_confidence: float  # lowest word-level confidence in this cell
+    min_confidence: float
     is_low_confidence: bool = False
 
 
@@ -84,174 +54,153 @@ class TableData:
 
 
 def analyze_document(file_path: str) -> list[TableData]:
-    """Analyze a document or image and return tables + plain-text pages."""
     path = Path(file_path)
     ext = path.suffix.lower()
     if ext not in SUPPORTED_EXTENSIONS:
         raise ValueError(
             f"Unsupported file type '{ext}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
         )
-
-    structure_engine, ocr_engine = _get_engines()
-
     if ext == ".pdf":
-        images = _pdf_to_images(file_path)
-    else:
-        img = cv2.imread(file_path)
-        if img is None:
-            raise ValueError(f"Could not read image: {file_path}")
-        images = [img]
-
-    all_tables: list[TableData] = []
-    for page_num, img in enumerate(images, start=1):
-        page_results = _process_image(img, page_num, structure_engine, ocr_engine)
-        all_tables.extend(page_results)
-
-    return all_tables
+        return _analyze_pdf(file_path)
+    img = cv2.imread(file_path)
+    if img is None:
+        raise ValueError(f"Could not read image: {file_path}")
+    return _analyze_image_array(img, page_num=1)
 
 
-def _pdf_to_images(pdf_path: str) -> list[np.ndarray]:
-    """Convert each PDF page to a BGR numpy array at 200 DPI."""
+# ── PDF ───────────────────────────────────────────────────────────────────────
+
+def _analyze_pdf(pdf_path: str) -> list[TableData]:
+    import pdfplumber
+    results = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            page_results = _process_pdfplumber_page(page, page_num)
+            if not page_results:
+                # Scanned page — render to image and OCR
+                img = _pdf_page_to_image(pdf_path, page_num - 1)
+                page_results = _analyze_image_array(img, page_num)
+            results.extend(page_results)
+    return results
+
+
+def _process_pdfplumber_page(page, page_num: int) -> list[TableData]:
+    results = []
+
+    for raw_table in page.extract_tables() or []:
+        if not raw_table:
+            continue
+        row_count = len(raw_table)
+        col_count = max((len(r) for r in raw_table), default=0)
+        if not row_count or not col_count:
+            continue
+        td = TableData(page=page_num, row_count=row_count, col_count=col_count)
+        for r_idx, row in enumerate(raw_table):
+            for c_idx in range(col_count):
+                text = (row[c_idx] if c_idx < len(row) else None) or ""
+                td.cells.append(CellData(
+                    row=r_idx, col=c_idx,
+                    row_span=1, col_span=1,
+                    text=text.strip(),
+                    min_confidence=1.0,
+                ))
+        results.append(td)
+
+    if not results:
+        text = page.extract_text() or ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            td = TableData(page=page_num, row_count=len(lines), col_count=1, is_plain_text=True)
+            for r_idx, line in enumerate(lines):
+                td.cells.append(CellData(
+                    row=r_idx, col=0, row_span=1, col_span=1,
+                    text=line, min_confidence=1.0,
+                ))
+            results.append(td)
+
+    return results
+
+
+def _pdf_page_to_image(pdf_path: str, page_index: int) -> np.ndarray:
     doc = fitz.open(pdf_path)
-    images = []
-    for page in doc:
-        pix = page.get_pixmap(dpi=200)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        if pix.n == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        elif pix.n == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        images.append(img)
+    pix = doc[page_index].get_pixmap(dpi=200)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     doc.close()
-    return images
+    if pix.n == 4:
+        return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-def _process_image(
-    img: np.ndarray,
-    page_num: int,
-    structure_engine: PPStructure,
-    ocr_engine: PaddleOCR,
-) -> list[TableData]:
-    """Run structure + OCR analysis on one page image."""
-    structure_results = structure_engine(img.copy())
+# ── Image ─────────────────────────────────────────────────────────────────────
 
-    # Full-page OCR to get per-word confidence scores
-    ocr_results = ocr_engine.ocr(img.copy(), cls=True)
-    word_confidence: dict[str, list[float]] = {}
-    if ocr_results and ocr_results[0]:
-        for line in ocr_results[0]:
-            if line and len(line) == 2:
-                text, conf = line[1]
-                word_confidence.setdefault(text.strip(), []).append(float(conf))
+def _analyze_image_array(img: np.ndarray, page_num: int) -> list[TableData]:
+    try:
+        return _img2table_extract(img, page_num)
+    except Exception:
+        return _easyocr_plain_text(img, page_num)
 
-    tables: list[TableData] = []
-    text_lines: list[tuple[str, float]] = []
 
-    for region in (structure_results or []):
-        rtype = region.get("type", "")
-        res = region.get("res", {})
+def _img2table_extract(img: np.ndarray, page_num: int) -> list[TableData]:
+    import tempfile
+    from img2table.document import Image as Img2Image
+    from img2table.ocr import EasyOCR as Img2EasyOCR
 
-        if rtype == "table":
-            html = res.get("html", "") if isinstance(res, dict) else ""
-            if html:
-                table_data = _table_from_html(html, page_num, word_confidence)
-                if table_data:
-                    tables.append(table_data)
-        else:
-            # Text / title / list regions — collect lines with confidence
-            lines = res if isinstance(res, list) else []
-            for line in lines:
-                if isinstance(line, list) and len(line) == 2:
-                    text_conf = line[1]
-                    if isinstance(text_conf, (list, tuple)) and len(text_conf) == 2:
-                        text, conf = text_conf
-                        if text.strip():
-                            text_lines.append((text.strip(), float(conf)))
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    cv2.imwrite(tmp_path, img)
 
-    # Emit a plain-text sheet only for pages that have no tables
-    if text_lines and not tables:
-        plain = TableData(
-            page=page_num,
-            row_count=len(text_lines),
-            col_count=1,
-            is_plain_text=True,
+    try:
+        ocr = Img2EasyOCR(reader=_get_ocr_reader())
+        doc = Img2Image(src=tmp_path)
+        extracted = doc.extract_tables(
+            ocr=ocr, implicit_rows=True, borderless_tables=True, min_confidence=50
         )
-        for row_idx, (text, conf) in enumerate(text_lines):
-            plain.cells.append(CellData(
-                row=row_idx, col=0, row_span=1, col_span=1,
-                text=text, min_confidence=conf,
-                is_low_confidence=conf < config.CONFIDENCE_THRESHOLD,
-            ))
-        return [plain]
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
-    return tables
+    results = []
+    for table in (extracted or []):
+        td = _img2table_to_tabledata(table, page_num)
+        if td:
+            results.append(td)
+
+    if not results:
+        results = _easyocr_plain_text(img, page_num)
+    return results
 
 
-def _table_from_html(
-    html: str,
-    page_num: int,
-    word_confidence: dict[str, list[float]],
-) -> TableData | None:
-    """Convert a PaddleOCR HTML table string into a TableData with confidence scores."""
-    cells = _parse_html_table(html)
-    if not cells:
+def _img2table_to_tabledata(table, page_num: int) -> TableData | None:
+    try:
+        df = table.df
+        if df is None or df.empty:
+            return None
+        rows = df.fillna("").values.tolist()
+        row_count = len(rows)
+        col_count = max((len(r) for r in rows), default=0)
+        td = TableData(page=page_num, row_count=row_count, col_count=col_count)
+        for r_idx, row in enumerate(rows):
+            for c_idx, cell in enumerate(row):
+                text = str(cell).strip() if cell is not None else ""
+                td.cells.append(CellData(
+                    row=r_idx, col=c_idx, row_span=1, col_span=1,
+                    text=text, min_confidence=1.0,
+                ))
+        return td
+    except Exception:
         return None
 
-    max_row = max(row + rs for row, _, rs, _, _ in cells)
-    max_col = max(col + cs for _, col, _, cs, _ in cells)
 
-    table_data = TableData(page=page_num, row_count=max_row, col_count=max_col)
-    for row, col, row_span, col_span, text in cells:
-        min_conf = _min_confidence_for_text(text, word_confidence)
-        table_data.cells.append(CellData(
-            row=row, col=col,
-            row_span=row_span, col_span=col_span,
-            text=text,
-            min_confidence=min_conf,
-            is_low_confidence=min_conf < config.CONFIDENCE_THRESHOLD,
-        ))
-    return table_data
-
-
-def _parse_html_table(html: str) -> list[tuple[int, int, int, int, str]]:
-    """
-    Parse an HTML table into (row, col, rowspan, colspan, text) tuples.
-    Uses a grid-fill algorithm to correctly handle merged cells.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    rows_raw = soup.find_all("tr")
-    if not rows_raw:
+def _easyocr_plain_text(img: np.ndarray, page_num: int) -> list[TableData]:
+    reader = _get_ocr_reader()
+    ocr_results = reader.readtext(img)
+    lines = [(text.strip(), float(conf)) for (_, text, conf) in ocr_results if text.strip()]
+    if not lines:
         return []
-
-    occupied: set[tuple[int, int]] = set()
-    cells: list[tuple[int, int, int, int, str]] = []
-
-    for row_idx, tr in enumerate(rows_raw):
-        col_idx = 0
-        for td in tr.find_all(["td", "th"]):
-            while (row_idx, col_idx) in occupied:
-                col_idx += 1
-
-            text = td.get_text(strip=True)
-            rowspan = max(1, int(td.get("rowspan", 1)))
-            colspan = max(1, int(td.get("colspan", 1)))
-
-            for r in range(row_idx, row_idx + rowspan):
-                for c in range(col_idx, col_idx + colspan):
-                    occupied.add((r, c))
-
-            cells.append((row_idx, col_idx, rowspan, colspan, text))
-            col_idx += colspan
-
-    return cells
-
-
-def _min_confidence_for_text(text: str, word_confidence: dict[str, list[float]]) -> float:
-    if not text:
-        return 1.0
-    confidences: list[float] = []
-    for word in text.split():
-        scores = word_confidence.get(word.strip(), [])
-        if scores:
-            confidences.append(scores.pop(0))
-    return min(confidences) if confidences else 1.0
+    td = TableData(page=page_num, row_count=len(lines), col_count=1, is_plain_text=True)
+    for r_idx, (text, conf) in enumerate(lines):
+        td.cells.append(CellData(
+            row=r_idx, col=0, row_span=1, col_span=1,
+            text=text, min_confidence=conf,
+            is_low_confidence=conf < config.CONFIDENCE_THRESHOLD,
+        ))
+    return [td]
