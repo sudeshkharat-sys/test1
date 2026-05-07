@@ -146,10 +146,12 @@ else:
             df = df.reset_index(drop=True)
 
             low_conf_cells: set[tuple[int, int]] = set()
-            if not table.is_plain_text and table.cells:
-                for cell in table.cells:
-                    if cell.is_low_confidence and cell.row > 0:
-                        low_conf_cells.add((cell.row - 1, cell.col))
+            for cell in table.cells:
+                if cell.is_low_confidence:
+                    # plain-text df rows map 1:1; table df skips row 0 (header)
+                    df_row = cell.row if table.is_plain_text else cell.row - 1
+                    if df_row >= 0:
+                        low_conf_cells.add((df_row, cell.col))
 
             def highlight_low_conf(data: pd.DataFrame) -> pd.DataFrame:
                 styles = pd.DataFrame("", index=data.index, columns=data.columns)
