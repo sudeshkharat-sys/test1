@@ -52,8 +52,14 @@ def _get_engines() -> tuple[PPStructure, PaddleOCR]:
     global _structure_engine, _ocr_engine
     if _structure_engine is None:
         print("Loading PaddleOCR models (first run downloads ~500 MB)...")
-        _structure_engine = PPStructure(table=True, ocr=True, lang="en", show_log=False)
-        _ocr_engine = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        _structure_engine = PPStructure(
+            table=True, ocr=True, lang="en", show_log=False,
+            enable_mkldnn=False, use_gpu=False,
+        )
+        _ocr_engine = PaddleOCR(
+            use_angle_cls=True, lang="en", show_log=False,
+            enable_mkldnn=False, use_gpu=False,
+        )
     return _structure_engine, _ocr_engine
 
 
