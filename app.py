@@ -131,9 +131,22 @@ else:
 
         with st.expander(label, expanded=(idx == 0)):
             df = table_to_df(table)
+
+            # Make columns unique — duplicate headers break pandas Styler
+            seen: dict[str, int] = {}
+            new_cols = []
+            for col in df.columns:
+                if col in seen:
+                    seen[col] += 1
+                    new_cols.append(f"{col}.{seen[col]}")
+                else:
+                    seen[col] = 0
+                    new_cols.append(col)
+            df.columns = new_cols
+            df = df.reset_index(drop=True)
+
             low_conf_cells: set[tuple[int, int]] = set()
             if not table.is_plain_text and table.cells:
-                # row 0 is the header; data rows start at index 1
                 for cell in table.cells:
                     if cell.is_low_confidence and cell.row > 0:
                         low_conf_cells.add((cell.row - 1, cell.col))
@@ -147,7 +160,7 @@ else:
 
             st.dataframe(
                 df.style.apply(highlight_low_conf, axis=None),
-                use_container_width=True,
+                width="stretch",
             )
 
 # ── download ──────────────────────────────────────────────────────────────────
