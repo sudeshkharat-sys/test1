@@ -16,7 +16,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 import fitz  # PyMuPDF
-from paddleocr import PPStructure, PaddleOCR
+try:
+    from paddleocr import PPStructure, PaddleOCR
+except ImportError:
+    # PaddleOCR 3.x removed PPStructure from the top-level package.
+    # Try the internal module path used by some 3.x builds.
+    try:
+        from paddleocr.ppstructure import PPStructure  # type: ignore[no-redef]
+        from paddleocr import PaddleOCR
+    except ImportError as exc:
+        raise ImportError(
+            "Cannot import PPStructure from paddleocr. "
+            "Install a compatible version with:\n"
+            "    pip install 'paddleocr>=2.8.0,<3.0.0'"
+        ) from exc
 from bs4 import BeautifulSoup
 
 import config
